@@ -423,80 +423,6 @@ function findSection(lines, header) {
   return { start, end };
 }
 
-function setCodexModeSpecificConfig(mode) {
-  let lines = readText(CODEX_CONFIG_FILE).split(/(?<=\n)/).filter((line, index, arr) => !(line === '' && index === arr.length - 1));
-
-  function upsertTopLevel(key, newLine) {
-    const pattern = new RegExp(`^\\s*#?\\s*${escapeRegExp(key)}\\s*=`);
-    const result = [];
-    let replaced = false;
-    for (const line of lines) {
-      if (pattern.test(line)) {
-        if (!replaced) result.push(newLine);
-        replaced = true;
-      } else {
-        result.push(line);
-      }
-    }
-    if (!replaced) result.unshift(newLine);
-    lines = result;
-  }
-
-  const webSearchLine = mode === 'provider' ? 'web_search = "live"\n' : '#web_search = "live"\n';
-  const contextWindowLine = 'model_context_window = 256000\n';
-  const compactLine = '#model_auto_compact_token_limit = 900000\n';
-  const statusItems = [
-    'model-with-reasoning',
-    'fast-mode',
-    'context-window-size',
-    'context-used',
-    'context-remaining',
-    'used-tokens',
-    'total-input-tokens',
-    'total-output-tokens',
-    'git-branch',
-  ];
-  if (mode === 'official') statusItems.push('five-hour-limit', 'weekly-limit');
-  const statusLine = `status_line = [${statusItems.map((item) => `"${item}"`).join(', ')}]\n`;
-
-  upsertTopLevel('web_search', webSearchLine);
-  upsertTopLevel('model_context_window', contextWindowLine);
-  upsertTopLevel('model_auto_compact_token_limit', compactLine);
-
-  const tuiSection = findSection(lines, '[tui]');
-  if (!tuiSection) {
-    if (lines.length > 0 && lines[lines.length - 1] !== '\n') lines.push('\n');
-    if (lines.length > 0 && lines[lines.length - 1] !== '\n' && !String(lines[lines.length - 1]).endsWith('\n')) lines[lines.length - 1] += '\n';
-    lines.push('[tui]\n', statusLine);
-  } else {
-    const result = [];
-    let replaced = false;
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i];
-      if (i > tuiSection.start && i < tuiSection.end && /^\s*status_line\s*=/.test(line)) {
-        if (!replaced) result.push(statusLine);
-        replaced = true;
-      } else {
-        result.push(line);
-      }
-    }
-    lines = result;
-    if (!replaced) {
-      let insertAt = lines.length;
-      for (let i = tuiSection.start + 1; i < lines.length; i += 1) {
-        if (/^\s*\[[^\]]+\]\s*$/.test(lines[i])) {
-          insertAt = i;
-          break;
-        }
-      }
-      lines.splice(insertAt, 0, statusLine);
-    }
-  }
-
-  writeText(CODEX_CONFIG_FILE, lines.join(''));
-  logNote('config', `mode settings applied: ${mode}`);
-}
-
 function setCodexActiveProvider(providerId, mode) {
   const lines = readText(CODEX_CONFIG_FILE).split(/(?<=\n)/);
   const pattern = /^\s*#?\s*model_provider\s*=/;
@@ -611,7 +537,6 @@ function syncCodexProvider(providerId) {
   setCodexActiveProvider(providerId, 'provider');
   upsertCodexProviderSection(providerId, name, baseUrl, wireApi, requiresOpenaiAuth);
   upsertOrRemoveTopLevelString(CODEX_CONFIG_FILE, 'model', model);
-  setCodexModeSpecificConfig('provider');
   writeStateFile('codex', providerId, providerId);
 }
 
@@ -627,7 +552,6 @@ function switchCodexToOfficial() {
   restoreCodexOfficialOrClear();
   setCodexActiveProvider('', 'official');
   upsertOrRemoveTopLevelString(CODEX_CONFIG_FILE, 'model', '');
-  setCodexModeSpecificConfig('official');
   writeStateFile('codex', 'official', '');
 }
 

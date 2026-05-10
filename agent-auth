@@ -599,98 +599,6 @@ upsert_or_remove_top_level_string() {
   fi
 }
 
-set_codex_mode_specific_config() {
-  local mode="$1"
-
-  ruby -e '
-    path = ARGV[0]
-    mode = ARGV[1]
-    lines = File.read(path).lines
-
-    def upsert_top_level(lines, key, new_line)
-      pattern = /^\s*#?\s*#{Regexp.escape(key)}\s*=/
-      replaced = false
-      result = []
-
-      lines.each do |line|
-        if line.match?(pattern)
-          unless replaced
-            result << new_line
-            replaced = true
-          end
-        else
-          result << line
-        end
-      end
-
-      result.unshift(new_line) unless replaced
-      result
-    end
-
-    web_search_line = mode == "provider" ? "web_search = \"live\"\n" : "#web_search = \"live\"\n"
-    context_window_line = "model_context_window = 256000\n"
-    compact_line = "#model_auto_compact_token_limit = 900000\n"
-    status_items = [
-      "model-with-reasoning",
-      "fast-mode",
-      "context-window-size",
-      "context-used",
-      "context-remaining",
-      "used-tokens",
-      "total-input-tokens",
-      "total-output-tokens",
-      "git-branch"
-    ]
-    status_items += ["five-hour-limit", "weekly-limit"] if mode == "official"
-    status_line = "status_line = [#{status_items.map { |item| "\"#{item}\"" }.join(", ")}]\n"
-
-    lines = upsert_top_level(lines, "web_search", web_search_line)
-    lines = upsert_top_level(lines, "model_context_window", context_window_line)
-    lines = upsert_top_level(lines, "model_auto_compact_token_limit", compact_line)
-
-    tui_start = lines.index { |line| line.match?(/^\s*\[tui\]\s*$/) }
-
-    if tui_start.nil?
-      lines << "\n" unless lines.empty? || lines.last == "\n"
-      lines << "[tui]\n"
-      lines << status_line
-    else
-      tui_end = lines[(tui_start + 1)..].index { |line| line.match?(/^\s*\[[^\]]+\]\s*$/) }
-      tui_end = tui_end.nil? ? lines.length : tui_start + 1 + tui_end
-      replaced = false
-      result = []
-
-      lines.each_with_index do |line, idx|
-        if idx > tui_start && idx < tui_end && line.match?(/^\s*status_line\s*=/)
-          unless replaced
-            result << status_line
-            replaced = true
-          end
-        else
-          result << line
-        end
-      end
-
-      unless replaced
-        insert_at = result.length
-        result.each_with_index do |line, idx|
-          if idx > tui_start && line.match?(/^\s*\[[^\]]+\]\s*$/)
-            insert_at = idx
-            break
-          end
-        end
-        result.insert(insert_at, status_line)
-      end
-
-      lines = result
-    end
-
-    File.write(path, lines.join)
-  ' "$CODEX_CONFIG_FILE" "$mode"
-
-  log_note "config" "mode settings applied: $mode"
-}
-
 set_codex_active_provider() {
   local provider_id="$1"
   local mode="$2"
@@ -868,7 +776,6 @@ sync_codex_provider() {
   set_codex_active_provider "$provider_id" "provider"
   upsert_codex_provider_section "$provider_id" "$name" "$base_url" "$wire_api" "$requires_openai_auth"
   upsert_or_remove_top_level_string "$CODEX_CONFIG_FILE" "model" "$model"
-  set_codex_mode_specific_config "provider"
   write_state_file "codex" "$provider_id" "$provider_id"
 }
 
@@ -884,7 +791,6 @@ switch_codex_to_official() {
   restore_codex_official_or_clear
   set_codex_active_provider "" "official"
   upsert_or_remove_top_level_string "$CODEX_CONFIG_FILE" "model" ""
-  set_codex_mode_specific_config "official"
   write_state_file "codex" "official" ""
 }
 

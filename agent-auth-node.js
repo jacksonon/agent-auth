@@ -24,6 +24,7 @@ const GEMINI_DIR = process.env.GEMINI_DIR || path.join(HOME, '.gemini');
 const GEMINI_ENV_FILE = path.join(GEMINI_DIR, '.env');
 
 const DEFAULT_WIRE_API = 'responses';
+const CODEX_UNIFIED_PROVIDER_KEY = 'codex';
 const SUPPORTED_AGENTS = ['codex', 'claude', 'gemini'];
 const CHANGE_LOGS = [];
 
@@ -33,7 +34,7 @@ function fail(message) {
 }
 
 function usage() {
-  process.stdout.write(`Usage:\n  agent-auth help\n  agent-auth agents\n\n  agent-auth <agent> help\n  agent-auth <agent> list\n  agent-auth <agent> status\n  agent-auth <agent> official\n  agent-auth <agent> use <provider_id>\n  agent-auth <agent> add <provider_id> --url <base_url> --key <api_key> [--name <display_name>] [--model <model>] [--env KEY=VALUE ...]\n  agent-auth <agent> update <provider_id> [--name <display_name>] [--url <base_url>] [--key <api_key>] [--model <model>] [--env KEY=VALUE ...] [--unset-env KEY ...]\n  agent-auth <agent> delete <provider_id>\n  agent-auth codex sessions [YYYY|YYYYMM|YYYYMMDD] [--table|--tsv|--json] [--full] [--short-id] [--limit N]\n\nAgents:\n  codex   Render provider config into ~/.codex/config.toml + ~/.codex/auth.json\n  claude  Render provider env into ~/.claude/settings.json\n  gemini  Render provider env into ~/.gemini/.env\n\nNotes:\n  - Provider registry is stored under ~/.agent-auth/providers/<agent>/<provider_id>.json\n  - agent-auth keeps per-agent state in ~/.agent-auth/state/<agent>.json\n  - claude / gemini use common --url and --key flags, then map them to their runtime env names\n  - Extra provider-specific env vars can be supplied with repeated --env KEY=VALUE flags\n`);
+  process.stdout.write(`Usage:\n  agent-auth help\n  agent-auth agents\n  agent-auth backup help\n  agent-auth backup machine --repo <owner/repo> [--create-repo] [--message <text>]\n  agent-auth backup project --repo <owner/repo> [--project-dir <path>] [--project-name <name>] [--include <relative_path> ...] [--create-repo] [--message <text>]\n  agent-auth restore project --repo <owner/repo> [--project-dir <path>] [--project-name <name>] [--snapshot latest|<archive_name>] [--include <relative_path> ...]\n\n  agent-auth <agent> help\n  agent-auth <agent> list\n  agent-auth <agent> status\n  agent-auth <agent> official\n  agent-auth <agent> use <provider_id>\n  agent-auth <agent> add <provider_id> --url <base_url> --key <api_key> [--name <display_name>] [--model <model>] [--env KEY=VALUE ...]\n  agent-auth <agent> update <provider_id> [--name <display_name>] [--url <base_url>] [--key <api_key>] [--model <model>] [--env KEY=VALUE ...] [--unset-env KEY ...]\n  agent-auth <agent> delete <provider_id>\n  agent-auth codex sessions [YYYY|YYYYMM|YYYYMMDD] [--table|--tsv|--json] [--full] [--short-id] [--limit N]\n\nAgents:\n  codex   Render provider config into ~/.codex/config.toml + ~/.codex/auth.json\n  claude  Render provider env into ~/.claude/settings.json\n  gemini  Render provider env into ~/.gemini/.env\n\nNotes:\n  - Provider registry is stored under ~/.agent-auth/providers/<agent>/<provider_id>.json\n  - agent-auth keeps per-agent state in ~/.agent-auth/state/<agent>.json\n  - backup archives are encrypted before upload; set AGENT_AUTH_BACKUP_PASSPHRASE for non-interactive use\n  - claude / gemini use common --url and --key flags, then map them to their runtime env names\n  - Extra provider-specific env vars can be supplied with repeated --env KEY=VALUE flags\n`);
 }
 
 function usageForAgent(agent) {
@@ -426,7 +427,7 @@ function findSection(lines, header) {
 function setCodexActiveProvider(providerId, mode) {
   const lines = readText(CODEX_CONFIG_FILE).split(/(?<=\n)/);
   const pattern = /^\s*#?\s*model_provider\s*=/;
-  const replacement = mode === 'official' ? null : `model_provider = "${providerId}"\n`;
+  const replacement = mode === 'official' ? null : `model_provider = "${CODEX_UNIFIED_PROVIDER_KEY}"\n`;
   const result = [];
   let replaced = false;
 
@@ -440,12 +441,38 @@ function setCodexActiveProvider(providerId, mode) {
   }
   if (replacement && !replaced) result.unshift(replacement);
   writeText(CODEX_CONFIG_FILE, result.join(''));
-  logNote('config', mode === 'official' ? 'model_provider disabled' : `model_provider = ${providerId}`);
+  logNote('config', mode === 'official' ? 'model_provider disabled' : `model_provider = ${CODEX_UNIFIED_PROVIDER_KEY}`);
 }
 
-function upsertCodexProviderSection(providerId, name, baseUrl, wireApi, requiresOpenaiAuth) {
+function removeAllCodexProviderSections() {
+  if (!fs.existsSync(CODEX_CONFIG_FILE)) return [];
+  const lines = readText(CODEX_CONFIG_FILE).split(/(?<=\n)/);
+  const removed = [];
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const headerMatch = lines[i].match(/^\s*\[model_providers\.([^\]\s]+)\]\s*$/);
+    if (headerMatch) {
+      removed.push(headerMatch[1]);
+      i += 1;
+      while (i < lines.length && !/^\s*\[[^\]]+\]\s*$/.test(lines[i])) i += 1;
+      continue;
+    }
+    out.push(lines[i]);
+    i += 1;
+  }
+  writeText(CODEX_CONFIG_FILE, out.join(''));
+  return removed;
+}
+
+function upsertCodexProviderSection(name, baseUrl, wireApi, requiresOpenaiAuth) {
+  const removed = removeAllCodexProviderSections();
+  if (removed.length > 0) {
+    logNote('config', `removed all existing provider sections: ${removed.map((key) => `[model_providers.${key}]`).join(', ')}`);
+  }
+
   let lines = readText(CODEX_CONFIG_FILE).split(/(?<=\n)/).filter((line, index, arr) => !(line === '' && index === arr.length - 1));
-  const header = `[model_providers.${providerId}]`;
+  const header = `[model_providers.${CODEX_UNIFIED_PROVIDER_KEY}]`;
   const section = [
     `${header}\n`,
     `name = "${name}"\n`,
@@ -453,16 +480,11 @@ function upsertCodexProviderSection(providerId, name, baseUrl, wireApi, requires
     `wire_api = "${wireApi}"\n`,
     `requires_openai_auth = ${requiresOpenaiAuth}\n`,
   ];
-  const match = findSection(lines, header);
-  if (!match) {
-    if (lines.length > 0 && !String(lines[lines.length - 1]).endsWith('\n')) lines[lines.length - 1] += '\n';
-    if (lines.length > 0) lines.push('\n');
-    lines = lines.concat(section);
-  } else {
-    lines = [...lines.slice(0, match.start), ...section, ...lines.slice(match.end)];
-  }
+  if (lines.length > 0 && !String(lines[lines.length - 1]).endsWith('\n')) lines[lines.length - 1] += '\n';
+  if (lines.length > 0) lines.push('\n');
+  lines = lines.concat(section);
   writeText(CODEX_CONFIG_FILE, lines.join(''));
-  logNote('config', `provider section refreshed: [model_providers.${providerId}]`);
+  logNote('config', `unified provider section created: ${header} (base_url = ${baseUrl})`);
 }
 
 function removeCodexProviderSection(providerId) {
@@ -473,13 +495,16 @@ function removeCodexProviderSection(providerId) {
   if (!match) return;
   lines = [...lines.slice(0, match.start), ...lines.slice(match.end)];
   writeText(CODEX_CONFIG_FILE, lines.join(''));
-  logNote('config', `provider section removed: [model_providers.${providerId}]`);
+  logNote('config', `provider section removed: ${header}`);
 }
 
 function codexConfigMode() {
   const text = readText(CODEX_CONFIG_FILE);
   const match = text.match(/^[\t ]*model_provider[\t ]*=[\t ]*"([^"]+)"/m);
-  return match ? match[1] : 'official';
+  if (!match) return 'official';
+  const stateProvider = stateValue('codex', 'provider_id');
+  if (match[1] === CODEX_UNIFIED_PROVIDER_KEY && stateProvider) return stateProvider;
+  return match[1];
 }
 
 function writeCodexAuthFile(apiKey) {
@@ -535,7 +560,7 @@ function syncCodexProvider(providerId) {
 
   writeCodexAuthFile(apiKey);
   setCodexActiveProvider(providerId, 'provider');
-  upsertCodexProviderSection(providerId, name, baseUrl, wireApi, requiresOpenaiAuth);
+  upsertCodexProviderSection(name, baseUrl, wireApi, requiresOpenaiAuth);
   upsertOrRemoveTopLevelString(CODEX_CONFIG_FILE, 'model', model);
   writeStateFile('codex', providerId, providerId);
 }
@@ -551,6 +576,7 @@ function switchCodexToOfficial() {
   backupCodexOfficialIfPresent();
   restoreCodexOfficialOrClear();
   setCodexActiveProvider('', 'official');
+  removeCodexProviderSection(CODEX_UNIFIED_PROVIDER_KEY);
   upsertOrRemoveTopLevelString(CODEX_CONFIG_FILE, 'model', '');
   writeStateFile('codex', 'official', '');
 }
@@ -893,6 +919,9 @@ function deleteProvider(agent, providerId) {
     removeLegacyCodexProviderIfPresent(providerId);
     requireWritablePath(CODEX_CONFIG_FILE, 'codex config');
     removeCodexProviderSection(providerId);
+    if (activeProvider === providerId) {
+      removeCodexProviderSection(CODEX_UNIFIED_PROVIDER_KEY);
+    }
   }
 
   printBlockTitle(`Delete provider: ${agent}/${providerId}`);
@@ -981,6 +1010,11 @@ async function main(argv) {
   if (action === 'agents') {
     if (argv.length !== 1) fail('unexpected arguments for agents');
     listAgents();
+    return;
+  }
+  if (action === 'backup' || action === 'restore') {
+    const { runAgentBackupCommand } = require('./agent_backup.js');
+    runAgentBackupCommand(argv);
     return;
   }
 

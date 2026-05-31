@@ -23,6 +23,7 @@ GEMINI_ENV_FILE="$GEMINI_DIR/.env"
 
 DEFAULT_PACKY_BASE_URL="https://codex-api-slb.packycode.com/v1"
 DEFAULT_WIRE_API="responses"
+CODEX_UNIFIED_PROVIDER_KEY="codex"
 SUPPORTED_AGENTS=(codex claude gemini)
 
 typeset -ga CHANGE_LOGS=()
@@ -32,6 +33,10 @@ usage() {
 Usage:
   agent-auth help
   agent-auth agents
+  agent-auth backup help
+  agent-auth backup machine --repo <owner/repo> [--create-repo] [--message <text>]
+  agent-auth backup project --repo <owner/repo> [--project-dir <path>] [--project-name <name>] [--include <relative_path> ...] [--create-repo] [--message <text>]
+  agent-auth restore project --repo <owner/repo> [--project-dir <path>] [--project-name <name>] [--snapshot latest|<archive_name>] [--include <relative_path> ...]
 
   agent-auth <agent> help
   agent-auth <agent> list
@@ -51,6 +56,7 @@ Agents:
 Notes:
   - Provider registry is stored under ~/.agent-auth/providers/<agent>/<provider_id>.json
   - agent-auth keeps per-agent state in ~/.agent-auth/state/<agent>.json
+  - backup archives are encrypted before upload; set AGENT_AUTH_BACKUP_PASSPHRASE for non-interactive use
   - claude / gemini use common --url and --key flags, then map them to their runtime env names
   - Extra provider-specific env vars can be supplied with repeated --env KEY=VALUE flags
 EOF
@@ -605,11 +611,11 @@ set_codex_active_provider() {
 
   ruby -e '
     path = ARGV[0]
-    provider_id = ARGV[1]
+    unified_key = ARGV[1]
     mode = ARGV[2]
     lines = File.read(path).lines
     pattern = /^\s*#?\s*model_provider\s*=/
-    replacement = mode == "official" ? nil : "model_provider = \"#{provider_id}\"\n"
+    replacement = mode == "official" ? nil : "model_provider = \"#{unified_key}\"\n"
     replaced = false
     result = []
 
@@ -626,31 +632,31 @@ set_codex_active_provider() {
 
     result.unshift(replacement) if replacement && !replaced
     File.write(path, result.join)
-  ' "$CODEX_CONFIG_FILE" "$provider_id" "$mode"
+  ' "$CODEX_CONFIG_FILE" "$CODEX_UNIFIED_PROVIDER_KEY" "$mode"
 
   if [[ "$mode" == "official" ]]; then
     log_note "config" "model_provider disabled"
   else
-    log_note "config" "model_provider = $provider_id"
+    log_note "config" "model_provider = $CODEX_UNIFIED_PROVIDER_KEY"
   fi
 }
 
 upsert_codex_provider_section() {
-  local provider_id="$1"
-  local name="$2"
-  local base_url="$3"
-  local wire_api="$4"
-  local requires_openai_auth="$5"
+  local name="$1"
+  local base_url="$2"
+  local wire_api="$3"
+  local requires_openai_auth="$4"
+  local removed_all
 
-  ruby -e '
+  removed_all="$(ruby -e '
     path = ARGV[0]
-    provider_id = ARGV[1]
+    unified_key = ARGV[1]
     name = ARGV[2]
     base_url = ARGV[3]
     wire_api = ARGV[4]
     requires_openai_auth = ARGV[5]
-    lines = File.read(path).lines
-    header = "[model_providers.#{provider_id}]"
+    lines = File.exist?(path) ? File.read(path).lines : []
+    header = "[model_providers.#{unified_key}]"
     section = [
       "#{header}\n",
       "name = \"#{name}\"\n",
@@ -659,20 +665,39 @@ upsert_codex_provider_section() {
       "requires_openai_auth = #{requires_openai_auth}\n"
     ]
 
-    start = lines.index { |line| line.strip == header }
-    if start.nil?
-      lines << "\n" unless lines.empty? || lines.last == "\n"
-      lines.concat(section)
-    else
-      finish = lines[(start + 1)..].index { |line| line.match?(/^\s*\[[^\]]+\]\s*$/) }
-      finish = finish.nil? ? lines.length : start + 1 + finish
-      lines = lines[0...start] + section + lines[finish..]
+    removed = []
+    out = []
+    i = 0
+    while i < lines.length
+      m = lines[i].match(/^\s*\[model_providers\.([^\]\s]+)\]\s*$/)
+      if m
+        removed << m[1]
+        i += 1
+        while i < lines.length && lines[i] !~ /^\s*\[[^\]]+\]\s*$/
+          i += 1
+        end
+      else
+        out << lines[i]
+        i += 1
+      end
     end
 
-    File.write(path, lines.join)
-  ' "$CODEX_CONFIG_FILE" "$provider_id" "$name" "$base_url" "$wire_api" "$requires_openai_auth"
+    out << "\n" unless out.empty? || out.last == "\n"
+    out.concat(section)
+    File.write(path, out.join)
 
-  log_note "config" "provider section refreshed: [model_providers.$provider_id]"
+    print removed.join(",")
+  ' "$CODEX_CONFIG_FILE" "$CODEX_UNIFIED_PROVIDER_KEY" "$name" "$base_url" "$wire_api" "$requires_openai_auth")"
+
+  if [[ -n "$removed_all" ]]; then
+    local pretty="" key
+    for key in ${(s/,/)removed_all}; do
+      pretty+="${pretty:+, }[model_providers.${key}]"
+    done
+    log_note "config" "removed all existing provider sections: $pretty"
+  fi
+
+  log_note "config" "unified provider section created: [model_providers.$CODEX_UNIFIED_PROVIDER_KEY] (base_url = $base_url)"
 }
 
 remove_codex_provider_section() {
@@ -699,14 +724,25 @@ remove_codex_provider_section() {
 }
 
 codex_config_mode() {
-  ruby -e '
+  local raw
+  raw="$(ruby -e '
     text = File.read(ARGV[0])
     if (match = text.match(/^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"([^"]+)"/))
       puts match[1]
     else
       puts "official"
     end
-  ' "$CODEX_CONFIG_FILE"
+  ' "$CODEX_CONFIG_FILE")"
+
+  if [[ "$raw" == "$CODEX_UNIFIED_PROVIDER_KEY" ]]; then
+    local active_provider
+    active_provider="$(state_value "codex" "provider_id" 2>/dev/null || true)"
+    if [[ -n "$active_provider" ]]; then
+      echo "$active_provider"
+      return 0
+    fi
+  fi
+  echo "$raw"
 }
 
 write_codex_auth_file() {
@@ -774,7 +810,7 @@ sync_codex_provider() {
 
   write_codex_auth_file "$api_key"
   set_codex_active_provider "$provider_id" "provider"
-  upsert_codex_provider_section "$provider_id" "$name" "$base_url" "$wire_api" "$requires_openai_auth"
+  upsert_codex_provider_section "$name" "$base_url" "$wire_api" "$requires_openai_auth"
   upsert_or_remove_top_level_string "$CODEX_CONFIG_FILE" "model" "$model"
   write_state_file "codex" "$provider_id" "$provider_id"
 }
@@ -790,6 +826,7 @@ switch_codex_to_official() {
   backup_codex_official_if_present
   restore_codex_official_or_clear
   set_codex_active_provider "" "official"
+  remove_codex_provider_section "$CODEX_UNIFIED_PROVIDER_KEY"
   upsert_or_remove_top_level_string "$CODEX_CONFIG_FILE" "model" ""
   write_state_file "codex" "official" ""
 }
@@ -1256,6 +1293,9 @@ delete_provider() {
     remove_legacy_codex_provider_if_present "$provider_id"
     require_writable_path "$CODEX_CONFIG_FILE" "codex config"
     remove_codex_provider_section "$provider_id"
+    if [[ "$active_provider" == "$provider_id" ]]; then
+      remove_codex_provider_section "$CODEX_UNIFIED_PROVIDER_KEY"
+    fi
   fi
 
   local was_active="no"
@@ -1373,6 +1413,12 @@ main() {
       [[ $# -eq 0 ]] || fail "unexpected arguments for agents"
       list_agents
       return 0
+      ;;
+    backup|restore)
+      if [[ ! -f "$SCRIPT_DIR/agent_backup.js" ]]; then
+        fail "missing helper script: $SCRIPT_DIR/agent_backup.js"
+      fi
+      exec node "$SCRIPT_DIR/agent_backup.js" "$@"
       ;;
   esac
 
